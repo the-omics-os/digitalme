@@ -7,8 +7,6 @@ following the lobster pattern.
 
 import logging
 
-from langchain_aws import ChatBedrock
-
 from indra_agent.agents.indra_query_agent import indra_query_agent
 from indra_agent.agents.state import OverallState
 from indra_agent.agents.supervisor import create_supervisor_prompt
@@ -22,6 +20,7 @@ from indra_agent.langgraph_supervisor import (
     create_handoff_tool,
     create_supervisor,
 )
+from indra_agent.llm_factory import LLMFactory
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +63,13 @@ def create_causal_discovery_graph():
     # ==========================================
 
     logger.debug("Creating supervisor agent")
-    supervisor_llm = ChatBedrock(
-        model_id=settings.agent_model,
-        region_name=settings.aws_region,
-        model_kwargs={"temperature": 0.0},
+    supervisor_llm = LLMFactory.create_llm(
+        model_config={
+            "model_id": settings.agent_model,
+            "region_name": settings.aws_region,
+            "temperature": 0.0,
+        },
+        agent_name="supervisor",
     )
 
     # Create handoff tools for delegation

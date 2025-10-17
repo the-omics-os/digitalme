@@ -45,10 +45,7 @@ IMPORTANT GUIDELINES:
 EXAMPLE WORKFLOWS:
 
 User: "I'm moving from SF to LA, what should I consider?"
-You: "That's exciting! To give you relevant guidance, could you tell me:
-- Are you concerned about air quality or other environmental factors?
-- Do you have any respiratory sensitivities?
-- Are you looking for general awareness or specific precautions?"
+You: Delegate to the indra query agent and ask it to query: 
 
 User: "I'm mainly concerned about air quality and how it might affect my health."
 You: [Use delegate_to_web_researcher to get air quality data]

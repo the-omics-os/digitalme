@@ -33,3 +33,10 @@ class OverallState(TypedDict, total=False):
 
     # Metadata
     metadata: Dict[str, Any]
+
+    # Agent routing (required by supervisor pattern)
+    next_agent: str  # Which agent to call next
+    current_agent: str  # Currently executing agent
+
+    # LangGraph recursion control (required by LangGraph)
+    remaining_steps: int  # Number of recursion steps remaining

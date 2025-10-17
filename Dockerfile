@@ -1,6 +1,6 @@
-# Multi-stage build for INDRA Agent using Chainguard Python images
-# Provides minimal attack surface, no CVEs, and distroless runtime
-# Optimized for LangGraph + AWS Bedrock deployment
+# Multi-stage build for healthOS Bot with integrated INDRA Agent
+# Provides minimal attack surface using Chainguard Python images
+# Optimized for Telegram bot + LangGraph + AWS Bedrock deployment
 
 # =============================================================================
 # Build Stage: Install dependencies in virtual environment
@@ -16,20 +16,16 @@ WORKDIR /opt/app
 # Create virtual environment
 RUN python -m venv /opt/app/venv
 
-# Copy dependency files
-# Note: requirements.txt includes `-e .` which requires pyproject.toml
-COPY requirements.txt pyproject.toml ./
-
-# Install dependencies using cache and bind mounts for efficiency
-# This approach leverages Docker's BuildKit for faster builds
-# Split installation: first install packages, then install local package
+# Copy bot requirements and install bot dependencies first
+COPY healthos_bot/requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     /opt/app/venv/bin/pip install --upgrade pip setuptools wheel && \
-    grep -v "^-e" requirements.txt > requirements-no-editable.txt && \
-    /opt/app/venv/bin/pip install --no-cache-dir -r requirements-no-editable.txt
+    /opt/app/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and install as editable package
-COPY indra_agent/ ./indra_agent/
+# Copy indra_agent and its pyproject.toml, then install as editable package
+# This allows bot.py to import indra_agent modules
+COPY pyproject.toml ./pyproject.toml
+COPY healthos_bot/indra_agent/ ./indra_agent/
 RUN /opt/app/venv/bin/pip install --no-cache-dir -e .
 
 # =============================================================================

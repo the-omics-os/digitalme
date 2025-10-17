@@ -1,5 +1,6 @@
 import yaml
 import dotenv
+import os
 from pathlib import Path
 
 config_dir = Path(__file__).parent.parent.resolve() / "config"
@@ -8,7 +9,11 @@ config_dir = Path(__file__).parent.parent.resolve() / "config"
 with open(config_dir / "config.yml", 'r') as f:
     config_yaml = yaml.safe_load(f)
 
-# load .env config
+# Load .env file into os.environ (required for indra_agent AWS credentials)
+# This must happen BEFORE any indra_agent imports
+dotenv.load_dotenv(config_dir / "config.env", override=False)
+
+# Also load as dict for backward compatibility
 config_env = dotenv.dotenv_values(config_dir / "config.env")
 
 # config parameters

@@ -8,13 +8,13 @@ import json
 import logging
 from typing import List
 
-from langchain_aws import ChatBedrock
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 from indra_agent.agents.state import OverallState
 from indra_agent.config.agent_config import WEB_RESEARCHER_CONFIG
 from indra_agent.config.settings import get_settings
+from indra_agent.llm_factory import LLMFactory
 from indra_agent.services.web_data_service import WebDataService
 
 logger = logging.getLogger(__name__)
@@ -46,11 +46,14 @@ def web_research_agent(
     settings = get_settings()
     config = WEB_RESEARCHER_CONFIG
 
-    # Initialize LLM
-    llm = ChatBedrock(
-        model_id=settings.agent_model,
-        region_name=settings.aws_region,
-        model_kwargs={"temperature": config.temperature},
+    # Initialize LLM using factory
+    llm = LLMFactory.create_llm(
+        model_config={
+            "model_id": settings.agent_model,
+            "region_name": settings.aws_region,
+            "temperature": config.temperature,
+        },
+        agent_name=agent_name,
     )
 
     if callback_handler and hasattr(llm, "with_config"):

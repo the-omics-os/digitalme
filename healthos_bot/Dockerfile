@@ -18,8 +18,10 @@ COPY healthos_bot/requirements.txt /tmp/requirements.txt
 RUN pip3 install -r /tmp/requirements.txt && rm -r /tmp/requirements.txt
 
 # Copy and install indra_agent (direct Python import integration)
+# indra_agent is now inside healthos_bot folder
 # Copy indra_agent source to permanent location (needed for editable install)
-COPY indra_agent /opt/indra_agent
+COPY healthos_bot/indra_agent /opt/indra_agent
+# Copy root-level pyproject.toml (contains indra_agent package definition)
 COPY pyproject.toml /opt/pyproject.toml
 
 # Install indra_agent in editable mode (keeps source at /opt/indra_agent)

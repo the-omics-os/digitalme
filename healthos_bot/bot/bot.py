@@ -4,6 +4,7 @@ import asyncio
 import traceback
 import html
 import json
+import sys
 from datetime import datetime
 
 import telegram
@@ -31,6 +32,7 @@ import database
 
 import base64
 from ddgs import DDGS
+import os
 
 # setup logger BEFORE using it
 logger = logging.getLogger(__name__)
@@ -38,7 +40,24 @@ logger = logging.getLogger(__name__)
 # setup
 db = database.Database()
 
+# Ensure AWS credentials are loaded into environment for indra_agent
+# The config module already called load_dotenv(), but let's verify
+if not os.environ.get('AWS_ACCESS_KEY_ID'):
+    logger.warning("AWS_ACCESS_KEY_ID not found in environment, attempting to load from config.env")
+    # Load from config.config_env as fallback
+    if hasattr(config, 'config_env'):
+        for key in ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION']:
+            if key in config.config_env and config.config_env[key]:
+                os.environ[key] = config.config_env[key]
+                logger.info(f"Loaded {key} from config.env into environment")
+else:
+    logger.info(f"AWS credentials found in environment (AWS_REGION: {os.environ.get('AWS_REGION', 'not set')})")
+
 # Import indra_agent for health intelligence (direct Python import, no HTTP)
+# Store detailed error information for debugging
+INDRA_IMPORT_ERROR = None
+INDRA_CLIENT_ERROR = None
+
 try:
     from indra_agent.core.client import INDRAAgentClient
     from indra_agent.core.models import (
@@ -49,10 +68,17 @@ try:
         RequestOptions
     )
     INDRA_AVAILABLE = True
-    logger.info("INDRA agent modules imported successfully")
-except ImportError as e:
+    logger.info("✅ INDRA agent modules imported successfully")
+except Exception as e:
     INDRA_AVAILABLE = False
-    logger.warning(f"INDRA agent not available: {e}")
+    INDRA_IMPORT_ERROR = {
+        'type': type(e).__name__,
+        'message': str(e),
+        'traceback': traceback.format_exc()
+    }
+    logger.error(f"❌ Failed to import INDRA agent: {type(e).__name__}: {e}", exc_info=True)
+    logger.error("Check that AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set in config/config.env")
+    logger.error("Also verify that all indra_agent dependencies are installed (langgraph, langchain-aws, boto3)")
 
 user_semaphores = {}
 user_tasks = {}
@@ -62,9 +88,14 @@ indra_client = None
 if INDRA_AVAILABLE:
     try:
         indra_client = INDRAAgentClient()
-        logger.info("INDRA agent client initialized")
+        logger.info("✅ INDRA agent client initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize INDRA client: {e}")
+        INDRA_CLIENT_ERROR = {
+            'type': type(e).__name__,
+            'message': str(e),
+            'traceback': traceback.format_exc()
+        }
+        logger.error(f"❌ Failed to initialize INDRA client: {e}", exc_info=True)
         INDRA_AVAILABLE = False
 
 HELP_MESSAGE = """Commands:
@@ -74,6 +105,7 @@ HELP_MESSAGE = """Commands:
 ⚪ /settings – Show settings
 ⚪ /balance – Show balance
 ⚪ /help – Show help
+⚪ /debug – Show INDRA agent status
 
 🎨 Generate images from text prompts in <b>👩‍🎨 Artist</b> /mode
 👥 Add bot to <b>group chat</b>: /help_group_chat
@@ -495,6 +527,89 @@ async def help_group_chat_handle(update: Update, context: CallbackContext):
      await update.message.reply_video(config.help_group_chat_video_path)
 
 
+async def debug_handle(update: Update, context: CallbackContext):
+    """Show detailed INDRA agent status for debugging."""
+    await register_user_if_not_exists(update, context, update.message.from_user)
+    user_id = update.message.from_user.id
+    db.set_user_attribute(user_id, "last_interaction", datetime.now())
+
+    # Build detailed debug report
+    debug_lines = ["🔧 <b>INDRA Agent Debug Report</b>\n"]
+
+    # INDRA availability status
+    if INDRA_AVAILABLE and indra_client:
+        debug_lines.append("✅ <b>Status:</b> INDRA agent is OPERATIONAL")
+    else:
+        debug_lines.append("❌ <b>Status:</b> INDRA agent is UNAVAILABLE")
+
+    debug_lines.append("")
+
+    # Environment variables check
+    debug_lines.append("🔐 <b>AWS Credentials:</b>")
+    aws_key_set = bool(os.environ.get('AWS_ACCESS_KEY_ID'))
+    aws_secret_set = bool(os.environ.get('AWS_SECRET_ACCESS_KEY'))
+    aws_region = os.environ.get('AWS_REGION', 'not set')
+
+    debug_lines.append(f"  • AWS_ACCESS_KEY_ID: {'✅ SET' if aws_key_set else '❌ NOT SET'}")
+    debug_lines.append(f"  • AWS_SECRET_ACCESS_KEY: {'✅ SET' if aws_secret_set else '❌ NOT SET'}")
+    debug_lines.append(f"  • AWS_REGION: {aws_region}")
+    debug_lines.append("")
+
+    # Import error details
+    if INDRA_IMPORT_ERROR:
+        debug_lines.append("❌ <b>Import Error:</b>")
+        debug_lines.append(f"  • Type: <code>{INDRA_IMPORT_ERROR['type']}</code>")
+        debug_lines.append(f"  • Message: <code>{html.escape(INDRA_IMPORT_ERROR['message'][:200])}</code>")
+        debug_lines.append("")
+
+        # Send full traceback in a separate message if needed
+        if len(INDRA_IMPORT_ERROR['traceback']) < 3000:
+            debug_lines.append("📋 <b>Full Traceback:</b>")
+            debug_lines.append(f"<pre>{html.escape(INDRA_IMPORT_ERROR['traceback'][:2000])}</pre>")
+
+    # Client initialization error
+    if INDRA_CLIENT_ERROR:
+        debug_lines.append("❌ <b>Client Initialization Error:</b>")
+        debug_lines.append(f"  • Type: <code>{INDRA_CLIENT_ERROR['type']}</code>")
+        debug_lines.append(f"  • Message: <code>{html.escape(INDRA_CLIENT_ERROR['message'][:200])}</code>")
+        debug_lines.append("")
+
+    # Python environment info
+    debug_lines.append("🐍 <b>Python Environment:</b>")
+    try:
+        import sys
+        debug_lines.append(f"  • Python: {sys.version.split()[0]}")
+        debug_lines.append(f"  • Working Dir: <code>{os.getcwd()}</code>")
+
+        # Check for key packages
+        packages_to_check = ['langgraph', 'langchain', 'langchain_aws', 'boto3', 'pydantic']
+        debug_lines.append("\n📦 <b>Dependencies:</b>")
+        for pkg in packages_to_check:
+            try:
+                mod = __import__(pkg)
+                version = getattr(mod, '__version__', 'unknown')
+                debug_lines.append(f"  • {pkg}: ✅ {version}")
+            except ImportError:
+                debug_lines.append(f"  • {pkg}: ❌ NOT INSTALLED")
+    except Exception as e:
+        debug_lines.append(f"  • Error getting env info: {e}")
+
+    debug_message = "\n".join(debug_lines)
+
+    # Send in chunks if too long
+    if len(debug_message) > 4000:
+        chunks = [debug_message[i:i+4000] for i in range(0, len(debug_message), 4000)]
+        for chunk in chunks:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(debug_message, parse_mode=ParseMode.HTML)
+
+    # If there's a traceback, send it separately
+    if INDRA_IMPORT_ERROR and len(INDRA_IMPORT_ERROR['traceback']) >= 3000:
+        traceback_msg = f"<b>Full Import Traceback:</b>\n<pre>{html.escape(INDRA_IMPORT_ERROR['traceback'][:4000])}</pre>"
+        await update.message.reply_text(traceback_msg, parse_mode=ParseMode.HTML)
+
+
 async def search_handle(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
     user_id = update.message.from_user.id
@@ -643,10 +758,29 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
             # Use INDRA/Bedrock for ALL queries (not just health)
             if not INDRA_AVAILABLE:
-                await update.message.reply_text(
-                    "❌ The bot is currently unavailable. AWS Bedrock integration is not initialized.",
-                    parse_mode=ParseMode.HTML
-                )
+                error_msg = "❌ <b>Bot Unavailable</b>\n\n"
+                error_msg += "The INDRA/AWS Bedrock integration failed to initialize.\n\n"
+
+                # Include specific error details
+                if INDRA_IMPORT_ERROR:
+                    error_msg += f"<b>Error Type:</b> {INDRA_IMPORT_ERROR['type']}\n"
+                    error_msg += f"<b>Error:</b> <code>{html.escape(INDRA_IMPORT_ERROR['message'][:150])}</code>\n\n"
+                elif INDRA_CLIENT_ERROR:
+                    error_msg += f"<b>Error Type:</b> {INDRA_CLIENT_ERROR['type']}\n"
+                    error_msg += f"<b>Error:</b> <code>{html.escape(INDRA_CLIENT_ERROR['message'][:150])}</code>\n\n"
+
+                # Check AWS credentials
+                aws_key_set = bool(os.environ.get('AWS_ACCESS_KEY_ID'))
+                aws_secret_set = bool(os.environ.get('AWS_SECRET_ACCESS_KEY'))
+
+                if not aws_key_set or not aws_secret_set:
+                    error_msg += "⚠️ <b>AWS credentials are missing!</b>\n"
+                    error_msg += f"  • AWS_ACCESS_KEY_ID: {'✅' if aws_key_set else '❌'}\n"
+                    error_msg += f"  • AWS_SECRET_ACCESS_KEY: {'✅' if aws_secret_set else '❌'}\n\n"
+
+                error_msg += "💡 Use /debug to see full diagnostic information."
+
+                await update.message.reply_text(error_msg, parse_mode=ParseMode.HTML)
                 return
 
             logger.info(f"Processing query from user {user_id}: {_message[:50]}...")
@@ -1052,9 +1186,60 @@ async def post_init(application: Application):
         BotCommand("/balance", "Show balance"),
         BotCommand("/settings", "Show settings"),
         BotCommand("/help", "Show help message"),
+        BotCommand("/debug", "Show INDRA agent diagnostics"),
     ])
 
 def run_bot() -> None:
+    # Print comprehensive startup diagnostics
+    logger.info("="*80)
+    logger.info("🚀 Starting healthOS Bot...")
+    logger.info("="*80)
+
+    # INDRA Status
+    if INDRA_AVAILABLE and indra_client:
+        logger.info("✅ INDRA Agent Status: OPERATIONAL")
+    else:
+        logger.error("❌ INDRA Agent Status: UNAVAILABLE")
+
+    # AWS Credentials
+    aws_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    aws_region = os.environ.get('AWS_REGION', 'not set')
+
+    logger.info(f"🔐 AWS Credentials:")
+    logger.info(f"   • AWS_ACCESS_KEY_ID: {'✅ SET (' + aws_key[:8] + '...)' if aws_key else '❌ NOT SET'}")
+    logger.info(f"   • AWS_SECRET_ACCESS_KEY: {'✅ SET' if aws_secret else '❌ NOT SET'}")
+    logger.info(f"   • AWS_REGION: {aws_region}")
+
+    # Import/Client Errors
+    if INDRA_IMPORT_ERROR:
+        logger.error(f"❌ Import Error: {INDRA_IMPORT_ERROR['type']}: {INDRA_IMPORT_ERROR['message'][:200]}")
+    if INDRA_CLIENT_ERROR:
+        logger.error(f"❌ Client Error: {INDRA_CLIENT_ERROR['type']}: {INDRA_CLIENT_ERROR['message'][:200]}")
+
+    # Dependencies
+    logger.info("📦 Key Dependencies:")
+    for pkg in ['langgraph', 'langchain', 'langchain_aws', 'boto3', 'pydantic']:
+        try:
+            mod = __import__(pkg)
+            version = getattr(mod, '__version__', 'unknown')
+            logger.info(f"   • {pkg}: ✅ {version}")
+        except ImportError:
+            logger.error(f"   • {pkg}: ❌ NOT INSTALLED")
+
+    # Environment
+    logger.info(f"🐍 Python: {sys.version.split()[0]}")
+    logger.info(f"📁 Working Directory: {os.getcwd()}")
+
+    logger.info("="*80)
+
+    if not INDRA_AVAILABLE:
+        logger.error("⚠️  WARNING: Bot will not function without INDRA agent!")
+        logger.error("⚠️  Users will see error messages. Check configuration above.")
+    else:
+        logger.info("✅ All systems ready! Bot is starting...")
+
+    logger.info("="*80)
     application = (
         ApplicationBuilder()
         .token(config.telegram_token)
@@ -1078,6 +1263,7 @@ def run_bot() -> None:
     application.add_handler(CommandHandler("start", start_handle, filters=user_filter))
     application.add_handler(CommandHandler("help", help_handle, filters=user_filter))
     application.add_handler(CommandHandler("help_group_chat", help_group_chat_handle, filters=user_filter))
+    application.add_handler(CommandHandler("debug", debug_handle, filters=user_filter))
     application.add_handler(CommandHandler("search", search_handle, filters=user_filter))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))

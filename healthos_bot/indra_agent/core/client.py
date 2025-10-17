@@ -55,6 +55,7 @@ class INDRAAgentClient:
                 "metadata": {},
                 "next_agent": "",
                 "current_agent": "",
+                "remaining_steps": 25,  # LangGraph recursion limit
             }
 
             # Run graph
