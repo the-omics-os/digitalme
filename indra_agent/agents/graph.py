@@ -1,92 +1,105 @@
-"""LangGraph workflow for causal discovery system."""
+"""LangGraph multi-agent graph using supervisor architecture.
+
+This uses the langgraph_supervisor package for automatic handoff handling
+and simplified agent coordination. Agents are created using factory functions
+following the lobster pattern.
+"""
 
 import logging
-from typing import Literal
 
-from langgraph.graph import END, StateGraph
+from langchain_aws import ChatBedrock
 
-from indra_agent.agents.indra_query_agent import create_indra_query_agent
+from indra_agent.agents.indra_query_agent import indra_query_agent
 from indra_agent.agents.state import OverallState
-from indra_agent.agents.supervisor import create_supervisor_agent
-from indra_agent.agents.web_researcher import create_web_researcher_agent
+from indra_agent.agents.supervisor import create_supervisor_prompt
+from indra_agent.agents.web_researcher import web_research_agent
+from indra_agent.config.agent_config import (
+    INDRA_QUERY_AGENT_CONFIG,
+    WEB_RESEARCHER_CONFIG,
+)
+from indra_agent.config.settings import get_settings
+from indra_agent.langgraph_supervisor import (
+    create_handoff_tool,
+    create_supervisor,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def create_causal_discovery_graph():
-    """Create the LangGraph workflow for causal discovery.
+    """Create the LangGraph workflow for causal discovery using supervisor pattern.
+
+    This function follows the lobster pattern by:
+    1. Calling factory functions to create worker agents
+    2. Creating supervisor with handoff tools
+    3. Compiling the workflow
 
     Returns:
         Compiled LangGraph workflow
     """
-    logger.info("Creating causal discovery graph")
+    logger.info("Creating causal discovery graph with supervisor architecture")
 
-    # Create workflow graph
-    workflow = StateGraph(OverallState)
+    settings = get_settings()
 
-    # Create agent instances (factory functions return coroutines, need to be called at runtime)
-    # For now we'll use async wrapper pattern
-    async def supervisor_node(state: OverallState, config):
-        agent = await create_supervisor_agent()
-        return await agent(state, config)
+    # ==========================================
+    # Create Worker Agents using Factory Functions
+    # ==========================================
 
-    async def indra_query_node(state: OverallState, config):
-        agent = await create_indra_query_agent()
-        result = await agent(state, config)
-        await agent.cleanup()
-        return result
-
-    async def web_researcher_node(state: OverallState, config):
-        agent = await create_web_researcher_agent()
-        result = await agent(state, config)
-        await agent.cleanup()
-        return result
-
-    # Add nodes
-    workflow.add_node("supervisor", supervisor_node)
-    workflow.add_node("indra_query_agent", indra_query_node)
-    workflow.add_node("web_researcher", web_researcher_node)
-
-    # Define routing logic
-    def route_supervisor(
-        state: OverallState,
-    ) -> Literal["indra_query_agent", "web_researcher", END]:
-        """Route from supervisor to next agent or END.
-
-        Args:
-            state: Current state
-
-        Returns:
-            Next node name
-        """
-        next_agent = state.get("next_agent", "END")
-        logger.info(f"Routing from supervisor to: {next_agent}")
-
-        if next_agent == "END":
-            return END
-        return next_agent
-
-    # Add edges
-    workflow.add_conditional_edges(
-        "supervisor",
-        route_supervisor,
-        {
-            "indra_query_agent": "indra_query_agent",
-            "web_researcher": "web_researcher",
-            END: END,
-        },
+    logger.debug("Creating INDRA query agent")
+    indra_agent = indra_query_agent(
+        callback_handler=None,
+        agent_name="indra_query_agent",
+        handoff_tools=None,  # Supervisor handles handoffs
     )
 
-    # Both specialist agents return to supervisor
-    workflow.add_edge("indra_query_agent", "supervisor")
-    workflow.add_edge("web_researcher", "supervisor")
+    logger.debug("Creating web research agent")
+    web_agent = web_research_agent(
+        callback_handler=None,
+        agent_name="web_researcher",
+        handoff_tools=None,  # Supervisor handles handoffs
+    )
 
-    # Set entry point
-    workflow.set_entry_point("supervisor")
+    # ==========================================
+    # Create Supervisor
+    # ==========================================
 
-    # Compile
+    logger.debug("Creating supervisor agent")
+    supervisor_llm = ChatBedrock(
+        model_id=settings.agent_model,
+        region_name=settings.aws_region,
+        model_kwargs={"temperature": 0.0},
+    )
+
+    # Create handoff tools for delegation
+    handoff_tools = [
+        create_handoff_tool(
+            agent_name="indra_query_agent",
+            name="delegate_to_indra_query",
+            description=INDRA_QUERY_AGENT_CONFIG.handoff_tool_description,
+        ),
+        create_handoff_tool(
+            agent_name="web_researcher",
+            name="delegate_to_web_researcher",
+            description=WEB_RESEARCHER_CONFIG.handoff_tool_description,
+        ),
+    ]
+
+    # Create supervisor workflow using create_supervisor
+    workflow = create_supervisor(
+        agents=[indra_agent, web_agent],
+        model=supervisor_llm,
+        prompt=create_supervisor_prompt(),
+        tools=handoff_tools,
+        state_schema=OverallState,
+        output_mode="last_message",
+        add_handoff_messages=True,
+        add_handoff_back_messages=True,
+        include_agent_name="inline",
+        supervisor_name="supervisor",
+    )
+
+    # Compile the graph
     graph = workflow.compile()
 
-    logger.info("Causal discovery graph compiled successfully")
-
+    logger.info("Causal discovery graph compiled successfully with supervisor pattern")
     return graph

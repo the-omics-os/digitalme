@@ -1,67 +1,109 @@
-"""Web researcher agent for environmental data collection."""
+"""Web Researcher Agent for environmental data collection and analysis.
 
+This agent is responsible for fetching current air quality data, analyzing
+environmental exposures, and calculating pollution deltas between locations.
+"""
+
+import json
 import logging
-from typing import Dict
+from typing import List
 
 from langchain_aws import ChatBedrock
-from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 
 from indra_agent.agents.state import OverallState
 from indra_agent.config.agent_config import WEB_RESEARCHER_CONFIG
 from indra_agent.config.settings import get_settings
 from indra_agent.services.web_data_service import WebDataService
-from langchain_core.messages import HumanMessage, SystemMessage
 
 logger = logging.getLogger(__name__)
 
 
-class WebResearcherAgent:
-    """Agent for fetching environmental and pollution data."""
+def web_research_agent(
+    callback_handler=None,
+    agent_name: str = "web_researcher",
+    handoff_tools: List = None,
+):
+    """
+    Create web research specialist agent for environmental data analysis.
 
-    def __init__(self):
-        """Initialize web researcher agent."""
-        self.settings = get_settings()
-        self.config = WEB_RESEARCHER_CONFIG
+    This expert agent specializes in:
+    - Fetching current air quality data (PM2.5, ozone, NO2)
+    - Analyzing historical environmental exposures
+    - Calculating environmental deltas (e.g., SF vs LA air quality)
+    - Providing context for environmental health impacts
 
-        # Initialize service
-        self.web_service = WebDataService()
+    Args:
+        callback_handler: Optional callback handler for LLM interactions
+        agent_name: Name identifier for the agent instance
+        handoff_tools: Additional tools for inter-agent communication
 
-        # Initialize LLM (AWS Bedrock - not heavily used, but available)
-        self.llm = ChatBedrock(
-            model_id=self.settings.agent_model,
-            region_name=self.settings.aws_region,
-            model_kwargs={"temperature": self.config.temperature},
-        )
+    Returns:
+        Configured ReAct agent with environmental analysis capabilities
+    """
 
-    async def __call__(
-        self, state: OverallState, config: RunnableConfig
-    ) -> Dict:
-        """Execute web researcher agent.
+    settings = get_settings()
+    config = WEB_RESEARCHER_CONFIG
+
+    # Initialize LLM
+    llm = ChatBedrock(
+        model_id=settings.agent_model,
+        region_name=settings.aws_region,
+        model_kwargs={"temperature": config.temperature},
+    )
+
+    if callback_handler and hasattr(llm, "with_config"):
+        llm = llm.with_config(callbacks=[callback_handler])
+
+    # Initialize services
+    web_service = WebDataService()
+
+    # Define tools for environmental operations
+    @tool
+    def analyze_environmental_data(location_history: list[dict]) -> str:
+        """Analyze environmental and pollution data for location history.
+
+        Use this tool to analyze a user's environmental exposure timeline based
+        on their location history. This will fetch PM2.5 levels and calculate
+        exposure changes between locations.
 
         Args:
-            state: Current workflow state
-            config: Runnable configuration
+            location_history: List of location dicts with structure:
+                [
+                    {
+                        "city": "San Francisco",
+                        "start_date": "2020-01-01",
+                        "end_date": "2023-06-01",
+                        "avg_pm25": 7.8  # optional, will use typical if not provided
+                    },
+                    {
+                        "city": "Los Angeles",
+                        "start_date": "2023-06-01",
+                        "end_date": "present"
+                    }
+                ]
 
         Returns:
-            Updated state dict
+            JSON string with environmental exposure data including timeline,
+            current exposure, and delta analysis
         """
-        logger.info("Web researcher agent executing")
-
         try:
-            # Get location history from user context
-            location_history = (
-                state.get("user_context", {}).get("location_history", [])
+            if not location_history:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "error": "No location history provided",
+                        "environmental_data": {},
+                    }
+                )
+
+            logger.info(
+                f"Analyzing environmental data for {len(location_history)} locations"
             )
 
-            if not location_history:
-                logger.warning("No location history provided")
-                return {
-                    "environmental_data": {},
-                    "current_agent": "web_researcher",
-                }
-
-            # Analyze location history
-            environmental_data = self.web_service.analyze_location_history(
+            # Use service to analyze location history
+            environmental_data = web_service.analyze_location_history(
                 location_history
             )
 
@@ -69,91 +111,119 @@ class WebResearcherAgent:
                 f"Environmental data collected for {len(environmental_data.get('exposures', []))} locations"
             )
 
-            # Use LLM to generate environmental summary
-            query_text = state.get("query", {}).get("text", "")
-            environmental_summary = await self._generate_environmental_summary(
-                query_text, location_history, environmental_data
+            return json.dumps(
+                {
+                    "status": "success",
+                    "environmental_data": environmental_data,
+                    "num_locations": len(location_history),
+                }
             )
 
-            # Add summary to environmental data
-            environmental_data["summary"] = environmental_summary
-
-            return {
-                "environmental_data": environmental_data,
-                "current_agent": "web_researcher",
-            }
-
         except Exception as e:
-            logger.error(f"Web researcher error: {e}", exc_info=True)
-            return {
-                "environmental_data": {},
-                "current_agent": "web_researcher",
-                "metadata": {"error": str(e)},
-            }
+            logger.error(f"Environmental analysis error: {e}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "environmental_data": {},
+                }
+            )
 
-    async def _generate_environmental_summary(
-        self, query_text: str, location_history: list, environmental_data: dict
-    ) -> str:
-        """Generate environmental summary using LLM.
+    @tool
+    async def get_current_pollution(city: str) -> str:
+        """Get current pollution data for a city.
+
+        Use this tool to fetch real-time or typical air quality data for a
+        specific city. This will attempt to use live APIs (IQAir) if configured,
+        or fall back to typical annual average values.
 
         Args:
-            query_text: Original query
-            location_history: User's location history
-            environmental_data: Collected environmental data
+            city: City name (e.g., "San Francisco", "Los Angeles", "New York")
 
         Returns:
-            Environmental summary string
+            JSON string with pollution metrics including PM2.5, source, and timestamp
         """
-        exposures = environmental_data.get("exposures", [])
-        exposure_summary = "\n".join([
-            f"- {exp.get('city', 'Unknown')}: PM2.5={exp.get('pm25', 'N/A')} µg/m³ "
-            f"({exp.get('start_date', 'unknown')} to {exp.get('end_date', 'present')})"
-            for exp in exposures
-        ])
-
-        messages = [
-            SystemMessage(content=self.config.system_prompt),
-            HumanMessage(content=f"""Analyze this environmental exposure data and generate a concise summary (<150 chars).
-
-Query: {query_text}
-
-Location History:
-{exposure_summary}
-
-Environmental Deltas: {environmental_data.get('delta_summary', 'None')}
-
-Focus on:
-1. Significant changes in exposure levels
-2. Health-relevant pollution thresholds
-3. Duration of exposures
-4. Comparative analysis between locations
-
-Generate a concise summary in <150 characters."""),
-        ]
-
         try:
-            response = await self.llm.ainvoke(messages)
-            summary = response.content.strip()
-            logger.info(f"LLM generated environmental summary: {summary}")
-            return summary
+            logger.info(f"Fetching pollution data for {city}")
+
+            # Use service to get pollution data
+            pollution_data = await web_service.get_pollution_data(city)
+
+            return json.dumps(
+                {
+                    "status": "success",
+                    "pollution_data": pollution_data,
+                    "city": city,
+                }
+            )
+
         except Exception as e:
-            logger.warning(f"LLM summary generation failed: {e}, using fallback")
-            # Fallback
-            if exposures:
-                latest = exposures[-1]
-                return f"{latest.get('city', 'Current location')}: PM2.5 {latest.get('pm25', 'unknown')} µg/m³"
-            return "Environmental data collected"
+            logger.error(f"Pollution data fetch error: {e}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "pollution_data": {},
+                }
+            )
 
-    async def cleanup(self):
-        """Cleanup resources."""
-        await self.web_service.close()
+    @tool
+    def calculate_exposure_delta(old_location: str, new_location: str) -> str:
+        """Calculate change in pollution exposure between two locations.
 
+        Use this tool to compare air quality between two cities and quantify
+        the exposure change (both absolute and fold-change).
 
-# Factory function for agent
-async def create_web_researcher_agent() -> WebResearcherAgent:
-    """Create web researcher agent instance.
+        Args:
+            old_location: Previous location (e.g., "San Francisco")
+            new_location: Current location (e.g., "Los Angeles")
 
-    Returns:
-        WebResearcherAgent instance
-    """
-    return WebResearcherAgent()
+        Returns:
+            JSON string with delta analysis including fold-change and description
+        """
+        try:
+            logger.info(
+                f"Calculating exposure delta: {old_location} -> {new_location}"
+            )
+
+            # Use service to calculate delta
+            delta_data = web_service.calculate_exposure_delta(
+                old_location, new_location
+            )
+
+            return json.dumps(
+                {
+                    "status": "success",
+                    "delta_data": delta_data,
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Delta calculation error: {e}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "delta_data": {},
+                }
+            )
+
+    # Combine base tools with handoff tools if provided
+    base_tools = [
+        analyze_environmental_data,
+        get_current_pollution,
+        calculate_exposure_delta,
+    ]
+    tools = base_tools + (handoff_tools or [])
+
+    # System prompt from config
+    system_prompt = config.system_prompt
+
+    # Return ReAct agent
+    return create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=system_prompt,
+        name=agent_name,
+        state_schema=OverallState,
+    )

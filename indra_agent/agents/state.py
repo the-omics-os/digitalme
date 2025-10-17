@@ -33,7 +33,3 @@ class OverallState(TypedDict, total=False):
 
     # Metadata
     metadata: Dict[str, Any]
-
-    # Routing
-    next_agent: Literal["indra_query_agent", "web_researcher", "END"]
-    current_agent: str

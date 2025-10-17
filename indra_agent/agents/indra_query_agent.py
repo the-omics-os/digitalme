@@ -1,11 +1,16 @@
-"""INDRA query agent for causal path discovery."""
+"""INDRA Query Agent for biological pathway analysis and causal graph construction.
 
+This agent is responsible for querying the INDRA bio-ontology database,
+grounding biological entities, and constructing causal graphs from pathways.
+"""
+
+import json
 import logging
-from typing import Dict
+from typing import List
 
 from langchain_aws import ChatBedrock
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
 
 from indra_agent.agents.state import OverallState
 from indra_agent.config.agent_config import INDRA_QUERY_AGENT_CONFIG
@@ -17,260 +22,169 @@ from indra_agent.services.indra_service import INDRAService
 logger = logging.getLogger(__name__)
 
 
-class INDRAQueryAgent:
-    """Agent for querying INDRA and constructing causal graphs."""
+def indra_query_agent(
+    callback_handler=None,
+    agent_name: str = "indra_query_agent",
+    handoff_tools: List = None,
+):
+    """
+    Create INDRA query specialist agent for biological pathway analysis.
 
-    def __init__(self):
-        """Initialize INDRA query agent."""
-        self.settings = get_settings()
-        self.config = INDRA_QUERY_AGENT_CONFIG
+    This expert agent specializes in:
+    - Grounding biological entities to database identifiers (MESH, HGNC, GO, CHEBI)
+    - Querying INDRA database for causal paths between entities
+    - Ranking paths by evidence count and confidence
+    - Building structured causal graphs with nodes and edges
+    - Calculating effect sizes and temporal lags from INDRA belief scores
 
-        # Initialize services
-        self.grounding_service = GroundingService()
-        self.indra_service = INDRAService()
-        self.graph_builder = GraphBuilderService()
+    Args:
+        callback_handler: Optional callback handler for LLM interactions
+        agent_name: Name identifier for the agent instance
+        handoff_tools: Additional tools for inter-agent communication
 
-        # Initialize LLM (AWS Bedrock)
-        self.llm = ChatBedrock(
-            model_id=self.settings.agent_model,
-            region_name=self.settings.aws_region,
-            model_kwargs={"temperature": self.config.temperature},
-        )
+    Returns:
+        Configured ReAct agent with INDRA analysis capabilities
+    """
 
-    async def __call__(
-        self, state: OverallState, config: RunnableConfig
-    ) -> Dict:
-        """Execute INDRA query agent.
+    settings = get_settings()
+    config = INDRA_QUERY_AGENT_CONFIG
+
+    # Initialize LLM
+    llm = ChatBedrock(
+        model_id=settings.agent_model,
+        region_name=settings.aws_region,
+        model_kwargs={"temperature": config.temperature},
+    )
+
+    if callback_handler and hasattr(llm, "with_config"):
+        llm = llm.with_config(callbacks=[callback_handler])
+
+    # Initialize services
+    grounding_service = GroundingService()
+    indra_service = INDRAService()
+    graph_builder = GraphBuilderService()
+
+    # Define tools for INDRA operations
+    @tool
+    async def analyze_biological_pathways(
+        query: str,
+        source_entities: list[str],
+        target_entities: list[str],
+        max_depth: int = 4,
+    ) -> str:
+        """Analyze biological pathways and construct causal graphs.
+
+        Use this tool to find causal relationships between biological entities
+        using the INDRA knowledge base. This will query for paths from source
+        entities (e.g., environmental exposures) to target entities (e.g., biomarkers).
 
         Args:
-            state: Current workflow state
-            config: Runnable configuration
+            query: The user's query text for context
+            source_entities: Source entities (e.g., ["PM2.5", "Ozone"])
+            target_entities: Target entities (e.g., ["CRP", "IL-6"])
+            max_depth: Maximum path depth to explore (default: 4)
 
         Returns:
-            Updated state dict
+            JSON string with causal graph data including nodes, edges, and paths
         """
-        logger.info("INDRA query agent executing")
-
         try:
-            # Extract entities from query using LLM
-            entities = await self._extract_entities(state)
-
-            # Ground entities
-            grounded = self.grounding_service.ground_entities(entities)
-
-            # Identify sources (exposures) and targets (biomarkers) using LLM
-            query_text = state.get("query", {}).get("text", "")
-            sources = await self._identify_sources(grounded, query_text)
-            targets = await self._identify_targets(grounded, state)
-
-            logger.info(f"Sources: {sources}, Targets: {targets}")
+            logger.info(
+                f"Analyzing pathways: {source_entities} -> {target_entities}"
+            )
 
             # Query INDRA for paths
             all_paths = []
-            for source in sources:
-                for target in targets:
-                    paths = await self.indra_service.find_causal_paths(
+            for source in source_entities:
+                for target in target_entities:
+                    paths = await indra_service.find_causal_paths(
                         source=source,
                         target=target,
-                        max_depth=state.get("options", {}).get("max_graph_depth", 4),
+                        max_depth=max_depth,
                     )
                     all_paths.extend(paths)
 
-            # Rank paths
-            ranked_paths = self.indra_service.rank_paths(all_paths)
-
+            # Rank paths by evidence and confidence
+            ranked_paths = indra_service.rank_paths(all_paths)
             logger.info(f"Found {len(ranked_paths)} causal paths")
 
-            # Build causal graph
-            causal_graph = self.graph_builder.build_causal_graph(
+            # Build causal graph from top paths
+            causal_graph = graph_builder.build_causal_graph(
                 paths=ranked_paths[:3],  # Use top 3 paths
-                genetics=state.get("user_context", {}).get("genetics", {}),
+                genetics={},  # TODO: Add genetics support
             )
 
-            # Update state
-            return {
-                "entities": entities,
-                "source_entities": sources,
-                "target_entities": targets,
-                "indra_paths": ranked_paths,
-                "causal_graph": causal_graph.model_dump(),
-                "current_agent": "indra_query_agent",
-            }
+            return json.dumps(
+                {
+                    "status": "success",
+                    "causal_graph": causal_graph.model_dump(),
+                    "num_paths": len(ranked_paths),
+                    "paths": ranked_paths[:5],  # Top 5 for context
+                    "query": query,
+                }
+            )
 
         except Exception as e:
-            logger.error(f"INDRA query agent error: {e}", exc_info=True)
-            # Return empty but valid causal graph to prevent downstream validation errors
-            return {
-                "current_agent": "indra_query_agent",
-                "causal_graph": {"nodes": [], "edges": [], "genetic_modifiers": []},
-                "metadata": {"error": str(e)},
-            }
+            logger.error(f"Pathway analysis error: {e}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "causal_graph": {
+                        "nodes": [],
+                        "edges": [],
+                        "genetic_modifiers": [],
+                    },
+                }
+            )
 
-    async def _extract_entities(self, state: OverallState) -> list:
-        """Extract entities from query text using LLM.
+    @tool
+    def ground_entities(entities: list[str]) -> str:
+        """Ground biological entities to database identifiers.
+
+        Use this tool to map entity names (like "CRP", "PM2.5", "IL-6") to
+        standardized database identifiers (MESH, HGNC, GO, CHEBI). This is
+        necessary before querying for causal paths.
 
         Args:
-            state: Current state
+            entities: List of entity names to ground (e.g., ["CRP", "IL-6"])
 
         Returns:
-            List of entity names
+            JSON string with grounded entities and their database identifiers
         """
-        query_text = state.get("query", {}).get("text", "")
-        focus_biomarkers = state.get("query", {}).get("focus_biomarkers", [])
-
-        # Use LLM to extract entities
-        messages = [
-            SystemMessage(content=self.config.system_prompt),
-            HumanMessage(content=f"""Extract biological entities from this query for causal path discovery.
-
-Query: {query_text}
-Focus Biomarkers: {focus_biomarkers}
-
-Identify:
-1. Environmental exposures (PM2.5, ozone, air pollution, chemicals)
-2. Biomarkers (CRP, IL-6, 8-OHdG, proteins, metabolites)
-3. Molecular mechanisms (oxidative stress, inflammation, NF-κB)
-4. Clinical outcomes (cardiovascular disease, cancer, etc.)
-
-Return ONLY a JSON list of entity names: ["entity1", "entity2", ...]"""),
-        ]
-
         try:
-            response = await self.llm.ainvoke(messages)
-            import json
-            entities = json.loads(response.content.strip())
-            logger.info(f"LLM extracted {len(entities)} entities: {entities}")
+            logger.info(f"Grounding {len(entities)} entities")
+            grounded = grounding_service.ground_entities(entities)
 
-            # Add focus biomarkers
-            entities.extend(focus_biomarkers)
+            return json.dumps(
+                {
+                    "status": "success",
+                    "grounded": grounded,
+                    "num_entities": len(entities),
+                }
+            )
 
-            # Deduplicate
-            return list(set(entities))
         except Exception as e:
-            logger.warning(f"LLM entity extraction failed: {e}, using fallback")
-            # Fallback to service-based extraction
-            entities = self.grounding_service.extract_entities_from_query(query_text)
-            entities.extend(focus_biomarkers)
-            return list(set(entities))
+            logger.error(f"Grounding error: {e}", exc_info=True)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                    "grounded": {},
+                }
+            )
 
-    async def _identify_sources(self, grounded: Dict, query_text: str) -> list:
-        """Identify source entities (environmental exposures) using LLM.
+    # Combine base tools with handoff tools if provided
+    base_tools = [analyze_biological_pathways, ground_entities]
+    tools = base_tools + (handoff_tools or [])
 
-        Args:
-            grounded: Grounded entities dict
-            query_text: Original query text
+    # System prompt from config
+    system_prompt = config.system_prompt
 
-        Returns:
-            List of source entity IDs in INDRA format
-        """
-        # Use LLM to identify sources
-        entity_list = "\n".join([f"- {name}: {data}" for name, data in grounded.items() if data])
-
-        messages = [
-            SystemMessage(content=self.config.system_prompt),
-            HumanMessage(content=f"""From these grounded entities, identify which are SOURCES (environmental exposures or upstream causes).
-
-Query: {query_text}
-
-Grounded Entities:
-{entity_list}
-
-Sources are typically:
-- Environmental exposures (PM2.5, ozone, pollution)
-- Chemicals or toxins
-- Lifestyle factors
-- Upstream causes
-
-Return ONLY a JSON list of entity IDs: ["entity_id1", "entity_id2", ...]
-If none found, return ["PM2.5"] as default."""),
-        ]
-
-        try:
-            response = await self.llm.ainvoke(messages)
-            import json
-            sources = json.loads(response.content.strip())
-            logger.info(f"LLM identified sources: {sources}")
-            return sources if sources else ["PM2.5"]
-        except Exception as e:
-            logger.warning(f"LLM source identification failed: {e}, using fallback")
-            # Fallback
-            sources = []
-            for entity_name, entity_data in grounded.items():
-                if entity_data and entity_data.get("type") == "environmental":
-                    sources.append(entity_data["id"])
-            return sources if sources else ["PM2.5"]
-
-    async def _identify_targets(self, grounded: Dict, state: OverallState) -> list:
-        """Identify target entities (biomarkers) using LLM.
-
-        Args:
-            grounded: Grounded entities dict
-            state: Current state
-
-        Returns:
-            List of target entity IDs in INDRA format
-        """
-        query_text = state.get("query", {}).get("text", "")
-        focus_biomarkers = state.get("query", {}).get("focus_biomarkers", [])
-        entity_list = "\n".join([f"- {name}: {data}" for name, data in grounded.items() if data])
-
-        messages = [
-            SystemMessage(content=self.config.system_prompt),
-            HumanMessage(content=f"""From these grounded entities, identify which are TARGETS (biomarkers or health outcomes).
-
-Query: {query_text}
-Focus Biomarkers: {focus_biomarkers}
-
-Grounded Entities:
-{entity_list}
-
-Targets are typically:
-- Clinical biomarkers (CRP, IL-6, 8-OHdG)
-- Health outcomes or diseases
-- Downstream effects
-- Measurable health indicators
-
-Return ONLY a JSON list of entity IDs: ["entity_id1", "entity_id2", ...]
-If none found, return ["IL6", "CRP"] as default."""),
-        ]
-
-        try:
-            response = await self.llm.ainvoke(messages)
-            import json
-            targets = json.loads(response.content.strip())
-            logger.info(f"LLM identified targets: {targets}")
-            return targets if targets else ["IL6", "CRP"]
-        except Exception as e:
-            logger.warning(f"LLM target identification failed: {e}, using fallback")
-            # Fallback
-            targets = []
-            for biomarker in focus_biomarkers:
-                if biomarker in grounded and grounded[biomarker]:
-                    targets.append(grounded[biomarker]["id"])
-
-            if not targets:
-                current_biomarkers = state.get("user_context", {}).get("current_biomarkers", {}).keys()
-                for biomarker in current_biomarkers:
-                    if biomarker in grounded and grounded[biomarker]:
-                        targets.append(grounded[biomarker]["id"])
-
-            if not targets:
-                for entity_name, entity_data in grounded.items():
-                    if entity_data and entity_data.get("type") == "biomarker":
-                        targets.append(entity_data["id"])
-
-            return targets if targets else ["IL6", "CRP"]
-
-    async def cleanup(self):
-        """Cleanup resources."""
-        await self.indra_service.close()
-
-
-# Factory function for agent
-async def create_indra_query_agent() -> INDRAQueryAgent:
-    """Create INDRA query agent instance.
-
-    Returns:
-        INDRAQueryAgent instance
-    """
-    return INDRAQueryAgent()
+    # Return ReAct agent
+    return create_react_agent(
+        model=llm,
+        tools=tools,
+        prompt=system_prompt,
+        name=agent_name,
+        state_schema=OverallState,
+    )
